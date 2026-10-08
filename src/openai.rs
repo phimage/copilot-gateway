@@ -11,10 +11,8 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 use tracing::debug;
 
-use crate::backend::TurnOptions;
 use crate::chat::{ChatRequest, Part, Role, ToolChoice, ToolDef, content_to_text, image_from_url};
 use crate::output::{FinalUsage, Finish, Item, OutEvent, OutputStream, new_id, now_secs};
-use crate::prompt;
 use crate::server::{ApiError, AppState, Flavor, parse_json, sse};
 
 const FLAVOR: Flavor = Flavor::OpenAi;
@@ -29,7 +27,6 @@ pub async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Res
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let model = req.model.clone();
-    let prompt = prompt::render(&req);
     debug!(
         model,
         stream,
@@ -40,16 +37,10 @@ pub async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Res
 
     let turn = state
         .backend
-        .start_turn(
-            prompt.clone(),
-            TurnOptions {
-                model: req.model.clone(),
-                reasoning_effort: req.reasoning_effort.clone(),
-            },
-        )
+        .start_turn(&req)
         .await
         .map_err(|e| ApiError::upstream(FLAVOR, e))?;
-    let out = OutputStream::new(turn, &req, &prompt);
+    let out = OutputStream::new(turn, &req);
 
     if stream {
         return Ok(sse(stream_chunks(out, model, include_usage)));
@@ -61,7 +52,7 @@ pub async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Res
         .items
         .iter()
         .filter_map(|i| match i {
-            Item::ToolCall { name, arguments } => Some(tool_call_json(name, arguments)),
+            Item::ToolCall { id, name, arguments } => Some(tool_call_json(id, name, arguments)),
             _ => None,
         })
         .collect();
@@ -86,9 +77,9 @@ pub async fn chat_completions(State(state): State<AppState>, body: Bytes) -> Res
     .into_response())
 }
 
-fn tool_call_json(name: &str, arguments: &Value) -> Value {
+fn tool_call_json(id: &str, name: &str, arguments: &Value) -> Value {
     json!({
-        "id": new_id("call_"),
+        "id": id,
         "type": "function",
         "function": {"name": name, "arguments": arguments_string(arguments)}
     })
@@ -139,8 +130,8 @@ fn stream_chunks(
             match ev {
                 OutEvent::Text(t) => yield Ok(chunk(json!({"content": t}), None)),
                 OutEvent::Thought(t) => yield Ok(chunk(json!({"reasoning_content": t}), None)),
-                OutEvent::ToolCall { name, arguments } => {
-                    let mut call = tool_call_json(&name, &arguments);
+                OutEvent::ToolCall { id, name, arguments } => {
+                    let mut call = tool_call_json(&id, &name, &arguments);
                     call["index"] = json!(tool_index);
                     tool_index += 1;
                     yield Ok(chunk(json!({"tool_calls": [call]}), None));

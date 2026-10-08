@@ -3,9 +3,9 @@
 Use your **GitHub Copilot subscription** from tools that speak the **Anthropic** or **OpenAI** API, such as **Claude Code** and **Codex CLI**.
 
 > [!IMPORTANT]
-> This is an unofficial, early project. Tool calls are emulated (not native), every request may count against your Copilot premium requests, and several API parameters are ignored. Read the **[Limitations](#limitations)** before using it.
+> This is an unofficial, early project. It relies on an undocumented Copilot CLI protocol, requests may count against your Copilot premium requests, and some API parameters are ignored. Read the **[Limitations](#limitations)** before using it.
 
-`copilot-gateway` is a single small binary (Rust, no runtime needed) for **macOS, Linux and Windows**. It starts the GitHub Copilot CLI in [Agent Client Protocol](https://agentclientprotocol.com) mode (`copilot --acp`) and exposes it as an HTTP server:
+`copilot-gateway` is a single small binary (Rust, no runtime needed) for **macOS, Linux and Windows**. It starts the GitHub Copilot CLI in headless mode and exposes it as an HTTP server:
 
 | API | Endpoint | Used by |
 | --- | --- | --- |
@@ -17,9 +17,9 @@ Use your **GitHub Copilot subscription** from tools that speak the **Anthropic**
 It can also **launch Claude Code or Codex for you**, already configured to use the gateway.
 
 ```
- Claude Code ─┐                           ┌───────────────────────┐
- Codex CLI  ──┼─ HTTP ─▶ copilot-gateway ─┼─ stdio (ACP) ─▶ copilot --acp ─▶ GitHub Copilot models
- your app   ──┘ (Anthropic / OpenAI API)  └───────────────────────┘
+ Claude Code ─┐                                   stdio (JSON-RPC)
+ Codex CLI  ──┼─ HTTP ─▶ copilot-gateway ─────────────────────────▶ copilot --headless ─▶ GitHub Copilot models
+ your app   ──┘ (Anthropic / OpenAI API)    (or copilot --acp with --backend acp)
 ```
 
 ---
@@ -95,7 +95,7 @@ copilot-gateway exec -- my-tool --flag              # any other tool
 The launcher:
 
 1. starts the gateway on `127.0.0.1` with a random port and a random API key,
-2. starts `copilot --acp` and checks that you are logged in,
+2. starts the Copilot CLI and checks that you are logged in,
 3. runs the tool in your terminal with the right configuration:
    - **claude**: `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, plus `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_HAIKU_MODEL` when `--model` / `--small-model` are given,
    - **codex**: a `copilot_gateway` model provider (Responses API) passed with `-c` options. The model defaults to Copilot's default model.
@@ -147,7 +147,7 @@ wire_api = "responses"
 # env_key = "COPILOT_GATEWAY_API_KEY"   # only if the server uses --api-key
 ```
 
-Set `model` explicitly. Codex's own default model makes it use an experimental tool format that works poorly with emulated tool calls.
+Set `model` explicitly: Codex adapts its tool set to the model name, and its own default model uses an experimental "code mode" tool format.
 
 ### Any OpenAI / Anthropic client
 
@@ -179,7 +179,7 @@ Streaming (`"stream": true`), tool/function calling and base64 images are suppor
 4. same family: `claude-opus-4-5` → newest available `claude-opus-*`, `gpt-5.1-codex` → `gpt-5-codex`,
 5. otherwise `--model` if given, else Copilot's default model.
 
-The selected model is logged (`model selected requested=... model=...`).
+The selected model is logged (`new Copilot session ... model=... requested=...`).
 
 ## Options
 
@@ -193,38 +193,55 @@ All options can go before or after the command. With `claude` / `codex` / `exec`
 | `-m, --model` | `COPILOT_GATEWAY_MODEL` | Copilot default | Default / forced model |
 | `--small-model` | `COPILOT_GATEWAY_SMALL_MODEL` | none | Claude Code background-task model |
 | `--model-map PATTERN=MODEL` | | | Rewrite requested model names (repeatable) |
+| `--backend sdk\|acp` | `COPILOT_GATEWAY_BACKEND` | `sdk` | How to drive Copilot (see [Backends](#backends)) |
 | `--copilot-bin` | `COPILOT_GATEWAY_COPILOT_BIN` | `copilot` | Copilot CLI executable |
 | `--copilot-arg ARG` | | | Extra argument for `copilot` (repeatable), e.g. `--copilot-arg=--reasoning-effort=high` |
 | `--copilot-env KEY=VALUE` | | | Extra environment variable for `copilot` (repeatable) |
 | `--no-default-copilot-args` | | | Don't pass the default `copilot` arguments (below) |
-| `--agent-tools` | | off | Keep Copilot's built-in tools (shell, file edits...) enabled |
-| `--permission deny\|allow` | | `deny` | Answer to Copilot's own tool permission requests |
+| `--agent-tools` | | off | ACP only: keep Copilot's built-in tools (shell, file edits...) enabled |
+| `--permission deny\|allow` | | `deny` | ACP only: answer to Copilot's own tool permission requests |
 | `--workdir` | `COPILOT_GATEWAY_WORKDIR` | `<temp>/copilot-gateway/workspace` | Working directory of Copilot sessions |
 | `--max-concurrent` | | `4` | Maximum parallel requests sent to Copilot |
+| `--session-ttl SECONDS` | | `1800` | SDK only: how long an idle conversation keeps its Copilot session |
+| `--max-sessions` | | `16` | SDK only: Copilot sessions kept alive between requests |
 | `--log-level` | `COPILOT_GATEWAY_LOG` | `info` | `error`, `warn`, `info`, `debug`, `trace` (`trace` logs request bodies) |
 | `--log-file` | | stderr / temp file | Log destination |
 
-Default `copilot` arguments: `--acp --disable-builtin-mcps --no-custom-instructions --no-ask-user --available-tools=` (the last one is omitted with `--agent-tools`).
+Default `copilot` arguments: `--headless --stdio --no-auto-update` (SDK backend), or `--acp --disable-builtin-mcps --no-custom-instructions --no-ask-user --available-tools=` (ACP backend; the last one is omitted with `--agent-tools`).
 
-## How it works
+## Backends
 
-- At startup the gateway spawns `copilot --acp` and talks JSON-RPC to it over stdin/stdout. If the process dies, it is restarted on the next request.
-- Each HTTP request creates a new ACP session in an empty working directory, selects the model (and reasoning effort when Copilot offers it), sends the whole conversation as one prompt, streams the reply back in the requested API format, and closes the session. If the client disconnects, the turn is cancelled.
-- **Client tools** (Claude Code's `Bash`, `Edit`..., Codex's `exec_command`, `apply_patch`...) are **emulated**. Their definitions are written into the prompt, and the model is asked to answer with `<tool_call>{"name": ..., "arguments": ...}</tool_call>` blocks. The gateway parses these while streaming and turns them into native `tool_use` / `tool_calls` / `function_call` items. The client runs the tool and sends the result back in the next request, as with a real API.
-- Copilot's **own** tools are disabled by default, and any permission request Copilot makes is denied, so Copilot behaves as a plain model and never touches your files. The client tool does that, with its own permission system.
+### `sdk` (default): Copilot SDK protocol
+
+The gateway runs `copilot --headless --stdio` and speaks the JSON-RPC protocol used by the official [GitHub Copilot SDK](https://github.com/github/copilot-sdk):
+
+- **Native client tools.** The client's tools (Claude Code's `Bash`, `Edit`..., Codex's `exec_command`, `apply_patch`...) are declared to Copilot as real tools. When the model calls one, the gateway returns a `tool_use` / `tool_calls` / `function_call` to the client, the client runs it, and its next request carries the result back to Copilot.
+- **The client's system prompt replaces Copilot's.** Copilot's own tools, custom instructions, skills and memory are disabled. Copilot behaves as a plain model and never touches your files; the client tool does that, with its own permission system.
+- **One Copilot session per conversation.** A tool loop (model → tool → result → model...) stays inside a single Copilot turn. A follow-up message continues the same session instead of resending the whole conversation. Idle sessions are kept for `--session-ttl` seconds.
+- **Real token usage** is reported, as given by Copilot.
+- Images are passed as attachments, including images in tool results (screenshots).
+
+### `acp`: Agent Client Protocol
+
+`--backend acp` runs `copilot --acp` ([Agent Client Protocol](https://agentclientprotocol.com)) instead. ACP has no way to declare client tools, so this backend **emulates** them: their definitions are written into the prompt, the model answers with `<tool_call>{"name": ..., "arguments": ...}</tool_call>` blocks, and the gateway turns them into native tool calls. Each request opens a new session and resends the whole conversation, and Copilot's own system prompt stays in place. Use it as a fallback if the SDK protocol changes in a Copilot CLI update.
+
+### Common to both
+
+- The Copilot process is started once and restarted if it dies. Sessions run in an empty working directory.
+- If the client disconnects, the running turn is cancelled.
 
 ## Development
 
 ```sh
-cargo test                 # unit tests + end-to-end HTTP tests against a built-in mock ACP agent
+cargo test                 # unit tests + end-to-end HTTP tests against built-in mock Copilot agents
 cargo clippy --all-targets
 ```
 
-The end-to-end tests run the gateway against a fake ACP agent built into the binary (enabled with the `COPILOT_GATEWAY_MOCK_AGENT=1` environment variable on the agent process). You can use it to try the gateway without a Copilot subscription:
+The end-to-end tests run the gateway against fake Copilot agents built into the binary, enabled with the `COPILOT_GATEWAY_MOCK_AGENT=sdk` (or `=acp`) environment variable on the agent process. You can use them to try the gateway without a Copilot subscription:
 
 ```sh
 copilot-gateway serve --copilot-bin "$(which copilot-gateway)" --no-default-copilot-args \
-  --copilot-env COPILOT_GATEWAY_MOCK_AGENT=1
+  --copilot-env COPILOT_GATEWAY_MOCK_AGENT=sdk
 ```
 
 **Releases**: push a tag such as `v0.1.0`. The [release workflow](.github/workflows/release.yml) builds the binaries for macOS (arm64, x64), Linux (static musl x64, arm64) and Windows (x64, arm64), and attaches them with SHA-256 checksums to a GitHub release. CI runs tests on all three operating systems for every push and pull request.
@@ -232,15 +249,14 @@ copilot-gateway serve --copilot-bin "$(which copilot-gateway)" --no-default-copi
 ## Limitations
 
 - **Unofficial.** This project is not affiliated with GitHub, Anthropic or OpenAI. Make sure your usage complies with the GitHub Copilot terms of service.
-- **Tool calling is emulated, not native.** Copilot's ACP mode does not expose the raw model API, so tool calls go through the text protocol described above. Strong models follow it well, but a model may sometimes write a malformed call, which is then returned as plain text. Very large tool sets (many MCP servers in Claude Code) make the prompt longer and calls less reliable.
-- **Copilot's own system prompt is still present.** The model is told to follow the client's system prompt and to act as a plain model, but it is still running inside the Copilot agent, so behavior can differ slightly from the vendor's API.
-- **Stateless, no prompt caching.** Each request opens a new Copilot session and resends the whole conversation. Long conversations mean big prompts and slower first tokens.
-- **Premium requests.** Each HTTP request is a Copilot prompt and may count against your premium request quota, with the model's multiplier. Claude Code and Codex send many requests: one per tool step, plus background tasks such as titles and summaries. Use `--small-model` with a model that is included in your plan for Claude Code's background tasks, and check your usage on GitHub.
-- **Approximate token usage.** Token counts come from Copilot when it reports them, otherwise they are estimated as characters ÷ 4. `count_tokens` is always an estimate.
-- **Ignored parameters:** `max_tokens`, `temperature`, `top_p`, stop sequences, `n`, `logprobs`, structured output (`response_format` / JSON schema), `parallel_tool_calls`. The model decides when to stop.
-- **Thinking / reasoning** is forwarded only when the client asks for it (Anthropic `thinking`, OpenAI `reasoning`). Anthropic thinking blocks carry no signature, and reasoning sent back by clients is not replayed to the model.
+- **Undocumented protocol.** The `sdk` backend speaks the Copilot SDK's JSON-RPC protocol (version 3), which is not publicly documented and is marked experimental. A Copilot CLI update could break it; `--backend acp` is the fallback.
+- **Premium requests.** Every new prompt sent to Copilot may count against your premium request quota, with the model's multiplier: each new conversation, each follow-up message, and each request the gateway cannot match to a live session. With the `sdk` backend, tool results continue the running turn instead of starting a new prompt. Claude Code also sends background requests (titles, summaries); use `--small-model` with a model included in your plan for those, and check your usage on GitHub.
+- **Conversation history.** Copilot only accepts history through its own sessions. When a request doesn't continue a session the gateway knows (gateway restart, session expired, history edited or compacted by the client, different model, system prompt or tools), a new session starts and the earlier messages are given to the model as a text transcript.
+- **Ignored parameters:** `max_tokens`, `temperature`, `top_p`, stop sequences, `n`, `logprobs`, structured output (`response_format` / JSON schema), `parallel_tool_calls`. Copilot does not expose them; the model decides when to stop.
+- **Tool choice:** "must call tool X" is forwarded; "must call any tool" and "no tools" are not enforced.
+- **Thinking / reasoning** is forwarded only when the client asks for it (Anthropic `thinking`, OpenAI `reasoning`). Anthropic thinking blocks carry no signature, and reasoning sent back by clients is not replayed.
 - **Content types:** text and base64 images are supported. Remote image URLs are not fetched (only the URL is passed on). PDFs and other binary documents are not supported. Server-side/hosted tools (Anthropic `web_search`, OpenAI `web_search`, code interpreter...) are ignored.
-- **Codex's default model** uses an experimental tool format. `copilot-gateway codex` therefore selects Copilot's default model. With `serve`, set `model` in `config.toml`.
-- **Model names** are matched approximately (see [Models](#models)). An unknown model silently falls back to the default. Check the logs if you need to know which model answered.
-- **Concurrency** is limited to `--max-concurrent` parallel requests (default 4) on a single `copilot` process.
-- **Early version.** The protocol handling is covered by end-to-end tests with a scripted ACP agent, and has been exercised with real Claude Code and Codex CLI clients. Copilot's ACP mode is itself young and may change between Copilot CLI releases.
+- **Token counts** are Copilot's when it reports them (`sdk`), otherwise estimated as characters ÷ 4 (`acp`). `count_tokens` is always an estimate.
+- **Model names** are matched approximately (see [Models](#models)). An unknown model silently falls back to the default; check the logs to know which model answered.
+- **`acp` backend only:** client tools are emulated through the prompt (a model may occasionally write a malformed call, returned as text), Copilot's own system prompt stays in place, and every request resends the whole conversation.
+- **Early version.** Protocol handling is covered by end-to-end tests with scripted mock agents and has been exercised with real Claude Code and Codex CLI clients, but not yet at scale with real Copilot models.

@@ -11,11 +11,9 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 use tracing::debug;
 
-use crate::backend::TurnOptions;
 use crate::chat::{ChatRequest, Part, Role, ToolDef, content_to_text, image_from_url};
 use crate::openai::parse_tool_choice;
 use crate::output::{FinalUsage, Item, OutEvent, OutputStream, new_id, now_secs};
-use crate::prompt;
 use crate::server::{ApiError, AppState, Flavor, parse_json, sse};
 
 const FLAVOR: Flavor = Flavor::OpenAi;
@@ -27,7 +25,6 @@ pub async fn create(State(state): State<AppState>, body: Bytes) -> Result<Respon
     let req = to_chat_request(&body).map_err(|e| ApiError::bad_request(FLAVOR, e))?;
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let reasoning = body.get("reasoning").is_some_and(|r| !r.is_null());
-    let prompt = prompt::render(&req);
     debug!(
         model = req.model,
         stream,
@@ -38,16 +35,10 @@ pub async fn create(State(state): State<AppState>, body: Bytes) -> Result<Respon
 
     let turn = state
         .backend
-        .start_turn(
-            prompt.clone(),
-            TurnOptions {
-                model: req.model.clone(),
-                reasoning_effort: req.reasoning_effort.clone(),
-            },
-        )
+        .start_turn(&req)
         .await
         .map_err(|e| ApiError::upstream(FLAVOR, e))?;
-    let out = OutputStream::new(turn, &req, &prompt);
+    let out = OutputStream::new(turn, &req);
     let mut encoder = Encoder::new(req.model.clone(), reasoning, req.namespaces.clone());
 
     if stream {
@@ -60,7 +51,7 @@ pub async fn create(State(state): State<AppState>, body: Bytes) -> Result<Respon
     for item in c.items {
         let ev = match item {
             Item::Text(t) => OutEvent::Text(t),
-            Item::ToolCall { name, arguments } => OutEvent::ToolCall { name, arguments },
+            Item::ToolCall { id, name, arguments } => OutEvent::ToolCall { id, name, arguments },
         };
         encoder.encode(ev);
     }
@@ -287,10 +278,10 @@ impl Encoder {
                     );
                 }
             }
-            OutEvent::ToolCall { name, arguments } => {
+            OutEvent::ToolCall { id, name, arguments } => {
                 self.close_open();
                 let output_index = self.output.len();
-                let call_id = new_id("call_");
+                let call_id = id;
                 let item = if name == LOCAL_SHELL {
                     let action = json!({
                         "type": "exec",
@@ -663,14 +654,17 @@ mod tests {
         enc.encode(OutEvent::Text("Hello ".into()));
         enc.encode(OutEvent::Text("world".into()));
         enc.encode(OutEvent::ToolCall {
+            id: "c0".into(),
             name: "shell".into(),
             arguments: json!({"command": ["ls"]}),
         });
         enc.encode(OutEvent::ToolCall {
+            id: "c1".into(),
             name: "apply_patch".into(),
             arguments: json!("*** Begin Patch"),
         });
         enc.encode(OutEvent::ToolCall {
+            id: "c2".into(),
             name: "multi_agent.spawn".into(),
             arguments: json!({}),
         });

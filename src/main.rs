@@ -7,8 +7,10 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use copilot_gateway::acp::{AgentCommand, PermissionPolicy};
 use copilot_gateway::backend::{Backend, BackendConfig};
+use copilot_gateway::engine::{BackendKind, Engine};
 use copilot_gateway::launch::{self, LaunchOptions, Tool};
 use copilot_gateway::mock_agent;
+use copilot_gateway::sdk::SdkBackend;
 use copilot_gateway::server::{self, AppState};
 use tracing::{info, warn};
 
@@ -49,6 +51,17 @@ struct Options {
     #[arg(long, env = "COPILOT_GATEWAY_API_KEY", global = true, hide_env_values = true)]
     api_key: Option<String>,
 
+    /// How to drive Copilot: `sdk` (Copilot SDK protocol, native client tools,
+    /// persistent sessions) or `acp` (Agent Client Protocol, emulated tools).
+    #[arg(
+        long,
+        value_enum,
+        env = "COPILOT_GATEWAY_BACKEND",
+        default_value = "sdk",
+        global = true
+    )]
+    backend: BackendKind,
+
     /// Copilot CLI executable (name in PATH or full path).
     #[arg(long, env = "COPILOT_GATEWAY_COPILOT_BIN", default_value = "copilot", global = true)]
     copilot_bin: String,
@@ -65,12 +78,12 @@ struct Options {
     #[arg(long = "copilot-env", value_parser = parse_key_value, global = true)]
     copilot_env: Vec<(String, String)>,
 
-    /// Keep Copilot's own built-in tools enabled (file edits, shell...).
-    /// By default they are disabled so Copilot behaves as a plain model.
+    /// ACP backend: keep Copilot's own built-in tools enabled (file edits,
+    /// shell...). By default they are disabled so Copilot behaves as a plain model.
     #[arg(long, global = true)]
     agent_tools: bool,
 
-    /// Answer to the agent's own tool permission requests.
+    /// ACP backend: answer to the agent's own tool permission requests.
     #[arg(long, value_enum, default_value = "deny", global = true)]
     permission: PermissionPolicy,
 
@@ -93,6 +106,14 @@ struct Options {
     /// Maximum number of concurrent requests sent to the agent.
     #[arg(long, default_value_t = 4, global = true)]
     max_concurrent: usize,
+
+    /// SDK backend: seconds an idle conversation keeps its Copilot session.
+    #[arg(long, default_value_t = 1800, global = true)]
+    session_ttl: u64,
+
+    /// SDK backend: maximum number of Copilot sessions kept between requests.
+    #[arg(long, default_value_t = 16, global = true)]
+    max_sessions: usize,
 
     /// Log filter (error, warn, info, debug, trace).
     #[arg(long, env = "COPILOT_GATEWAY_LOG", default_value = "info", global = true)]
@@ -138,7 +159,7 @@ fn parse_key_value(s: &str) -> Result<(String, String), String> {
 fn main() -> ExitCode {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     if std::env::var_os(mock_agent::ENV_VAR).is_some() {
-        return match runtime.block_on(mock_agent::run()) {
+        return match runtime.block_on(mock_agent::run_from_env()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(_) => ExitCode::FAILURE,
         };
@@ -191,17 +212,22 @@ fn backend_config(opts: &Options) -> Result<BackendConfig> {
 
     let mut args = Vec::new();
     if !opts.no_default_copilot_args {
-        args.extend(
-            [
-                "--acp",
-                "--disable-builtin-mcps",
-                "--no-custom-instructions",
-                "--no-ask-user",
-            ]
-            .map(String::from),
-        );
-        if !opts.agent_tools {
-            args.push("--available-tools=".into());
+        match opts.backend {
+            BackendKind::Sdk => args.extend(["--headless", "--stdio", "--no-auto-update"].map(String::from)),
+            BackendKind::Acp => {
+                args.extend(
+                    [
+                        "--acp",
+                        "--disable-builtin-mcps",
+                        "--no-custom-instructions",
+                        "--no-ask-user",
+                    ]
+                    .map(String::from),
+                );
+                if !opts.agent_tools {
+                    args.push("--available-tools=".into());
+                }
+            }
         }
     }
     args.extend(opts.copilot_args.iter().cloned());
@@ -225,6 +251,8 @@ fn backend_config(opts: &Options) -> Result<BackendConfig> {
         default_model: opts.model.clone(),
         model_map: opts.model_map.clone(),
         max_concurrent: opts.max_concurrent,
+        session_ttl: std::time::Duration::from_secs(opts.session_ttl),
+        max_sessions: opts.max_sessions,
     })
 }
 
@@ -246,7 +274,11 @@ async fn run(cli: Cli) -> Result<i32> {
     );
     let log_file = init_logging(&opts, launched)?;
 
-    let backend = Arc::new(Backend::new(backend_config(&opts)?));
+    let config = backend_config(&opts)?;
+    let backend = Arc::new(match opts.backend {
+        BackendKind::Sdk => Engine::Sdk(SdkBackend::new(config)),
+        BackendKind::Acp => Engine::Acp(Backend::new(config)),
+    });
 
     match command {
         Commands::Models => {
@@ -314,7 +346,7 @@ async fn launch_tool(
     tool: Tool,
     args: Vec<String>,
     opts: &Options,
-    backend: Arc<Backend>,
+    backend: Arc<Engine>,
     log_file: Option<PathBuf>,
 ) -> Result<i32> {
     let api_key = opts

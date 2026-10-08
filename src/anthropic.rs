@@ -11,10 +11,8 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 use tracing::debug;
 
-use crate::backend::TurnOptions;
 use crate::chat::{ChatRequest, Part, Role, ToolChoice, ToolDef, content_to_text, estimate_tokens};
 use crate::output::{Finish, Item, OutEvent, OutputStream, new_id};
-use crate::prompt;
 use crate::server::{ApiError, AppState, Flavor, parse_json, sse};
 
 const FLAVOR: Flavor = Flavor::Anthropic;
@@ -29,7 +27,6 @@ pub async fn messages(State(state): State<AppState>, body: Bytes) -> Result<Resp
         Some("enabled") | Some("adaptive")
     );
     let model = req.model.clone();
-    let prompt = prompt::render(&req);
     debug!(
         model,
         stream,
@@ -40,16 +37,10 @@ pub async fn messages(State(state): State<AppState>, body: Bytes) -> Result<Resp
 
     let turn = state
         .backend
-        .start_turn(
-            prompt.clone(),
-            TurnOptions {
-                model: req.model.clone(),
-                reasoning_effort: req.reasoning_effort.clone(),
-            },
-        )
+        .start_turn(&req)
         .await
         .map_err(|e| ApiError::upstream(FLAVOR, e))?;
-    let out = OutputStream::new(turn, &req, &prompt);
+    let out = OutputStream::new(turn, &req);
 
     if stream {
         let input_estimate = estimate_tokens(body.to_string().len());
@@ -63,8 +54,8 @@ pub async fn messages(State(state): State<AppState>, body: Bytes) -> Result<Resp
         for item in &c.items {
             match item {
                 Item::Text(t) => content.push(json!({"type": "text", "text": t})),
-                Item::ToolCall { name, arguments } => content.push(json!({
-                    "type": "tool_use", "id": new_id("toolu_"), "name": name, "input": arguments
+                Item::ToolCall { id, name, arguments } => content.push(json!({
+                    "type": "tool_use", "id": id, "name": name, "input": arguments
                 })),
             }
         }
@@ -171,13 +162,13 @@ impl Encoder {
                 self.open(Block::Text, &mut out);
                 out.push(self.delta(json!({"type": "text_delta", "text": t})));
             }
-            OutEvent::ToolCall { name, arguments } => {
+            OutEvent::ToolCall { id, name, arguments } => {
                 self.close(&mut out);
                 out.push(event(
                     "content_block_start",
                     json!({
                         "type": "content_block_start", "index": self.index,
-                        "content_block": {"type": "tool_use", "id": new_id("toolu_"), "name": name, "input": {}}
+                        "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
                     }),
                 ));
                 out.push(self.delta(json!({"type": "input_json_delta", "partial_json": arguments.to_string()})));

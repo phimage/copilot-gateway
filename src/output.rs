@@ -1,13 +1,12 @@
 //! Turns the raw agent event stream into API-level events (text, thinking,
 //! tool calls, completion), shared by every HTTP front-end.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 
 use serde_json::Value;
 
 use crate::backend::{Turn, TurnEvent};
-use crate::chat::{ChatRequest, estimate_tokens};
-use crate::prompt::{Parsed, ToolCallParser, normalize_arguments};
+use crate::chat::{ChatRequest, Part, estimate_tokens};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FinalUsage {
@@ -29,15 +28,13 @@ pub enum Finish {
 pub enum OutEvent {
     Text(String),
     Thought(String),
-    ToolCall { name: String, arguments: Value },
+    ToolCall { id: String, name: String, arguments: Value },
     Done { finish: Finish, usage: FinalUsage },
     Error(String),
 }
 
 pub struct OutputStream {
     turn: Turn,
-    parser: ToolCallParser,
-    freeform: HashSet<String>,
     queue: VecDeque<OutEvent>,
     finished: bool,
     prompt_chars: usize,
@@ -45,25 +42,35 @@ pub struct OutputStream {
     tool_calls: usize,
 }
 
+/// Size of the request content, used to estimate tokens when the backend
+/// does not report usage.
+fn request_chars(req: &ChatRequest) -> usize {
+    let mut chars: usize = req.system.iter().map(String::len).sum();
+    for m in &req.messages {
+        for p in &m.parts {
+            chars += match p {
+                Part::Text(t) => t.len(),
+                Part::Image { .. } => 1000,
+                Part::ToolCall { name, arguments, .. } => name.len() + arguments.to_string().len(),
+                Part::ToolResult { content, .. } => content.len(),
+            };
+        }
+    }
+    for t in &req.tools {
+        chars += t.name.len()
+            + t.description.as_ref().map_or(0, String::len)
+            + t.schema.as_ref().map_or(0, |s| s.to_string().len());
+    }
+    chars
+}
+
 impl OutputStream {
-    pub fn new(turn: Turn, req: &ChatRequest, prompt: &[Value]) -> Self {
-        let tools_enabled = !req.tools.is_empty() && req.tool_choice != crate::chat::ToolChoice::None;
-        let prompt_chars = prompt
-            .iter()
-            .map(|b| b.get("text").and_then(Value::as_str).map_or(1000, str::len))
-            .sum();
+    pub fn new(turn: Turn, req: &ChatRequest) -> Self {
         Self {
             turn,
-            parser: ToolCallParser::new(tools_enabled),
-            freeform: req
-                .tools
-                .iter()
-                .filter(|t| t.freeform)
-                .map(|t| t.name.clone())
-                .collect(),
             queue: VecDeque::new(),
             finished: false,
-            prompt_chars,
+            prompt_chars: request_chars(req),
             output_chars: 0,
             tool_calls: 0,
         }
@@ -71,22 +78,6 @@ impl OutputStream {
 
     pub fn model(&self) -> Option<&str> {
         self.turn.model.as_deref()
-    }
-
-    fn push_parsed(&mut self, parsed: Vec<Parsed>) {
-        for p in parsed {
-            match p {
-                Parsed::Text(t) => self.queue.push_back(OutEvent::Text(t)),
-                Parsed::ToolCall { name, arguments } => {
-                    self.tool_calls += 1;
-                    let freeform = self.freeform.contains(&name);
-                    self.queue.push_back(OutEvent::ToolCall {
-                        arguments: normalize_arguments(arguments, freeform),
-                        name,
-                    });
-                }
-            }
-        }
     }
 
     pub async fn next(&mut self) -> Option<OutEvent> {
@@ -100,16 +91,20 @@ impl OutputStream {
             match self.turn.events.recv().await {
                 Some(TurnEvent::Text(t)) => {
                     self.output_chars += t.len();
-                    let parsed = self.parser.push(&t);
-                    self.push_parsed(parsed);
+                    if !t.is_empty() {
+                        self.queue.push_back(OutEvent::Text(t));
+                    }
                 }
                 Some(TurnEvent::Thought(t)) => {
                     self.output_chars += t.len();
                     self.queue.push_back(OutEvent::Thought(t));
                 }
+                Some(TurnEvent::ToolCall { id, name, arguments }) => {
+                    self.tool_calls += 1;
+                    self.output_chars += arguments.to_string().len();
+                    self.queue.push_back(OutEvent::ToolCall { id, name, arguments });
+                }
                 Some(TurnEvent::Done { stop_reason, usage }) => {
-                    let parsed = self.parser.finish();
-                    self.push_parsed(parsed);
                     let finish = if self.tool_calls > 0 {
                         Finish::ToolCalls
                     } else {
@@ -131,8 +126,6 @@ impl OutputStream {
                     self.finished = true;
                 }
                 Some(TurnEvent::Error(e)) => {
-                    let parsed = self.parser.finish();
-                    self.push_parsed(parsed);
                     self.queue.push_back(OutEvent::Error(e));
                     self.finished = true;
                 }
@@ -155,7 +148,7 @@ impl OutputStream {
                     _ => c.items.push(Item::Text(t)),
                 },
                 OutEvent::Thought(t) => c.thinking.push_str(&t),
-                OutEvent::ToolCall { name, arguments } => c.items.push(Item::ToolCall { name, arguments }),
+                OutEvent::ToolCall { id, name, arguments } => c.items.push(Item::ToolCall { id, name, arguments }),
                 OutEvent::Done { finish, usage } => {
                     c.finish = finish;
                     c.usage = usage;
@@ -171,7 +164,7 @@ impl OutputStream {
 #[derive(Debug, Clone)]
 pub enum Item {
     Text(String),
-    ToolCall { name: String, arguments: Value },
+    ToolCall { id: String, name: String, arguments: Value },
 }
 
 #[derive(Debug, Clone)]

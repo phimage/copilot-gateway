@@ -1,5 +1,7 @@
-//! Runs prompt turns on the ACP agent: one ACP session per HTTP request.
+//! Shared turn/model types, and the ACP backend: one ACP session per HTTP
+//! request, client tools emulated through the prompt.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -10,6 +12,8 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::acp::{AcpProcess, AgentCommand, PermissionPolicy};
+use crate::chat::{ChatRequest, ToolChoice};
+use crate::prompt::{Parsed, ToolCallParser, normalize_arguments};
 
 #[derive(Debug, Clone)]
 pub struct BackendConfig {
@@ -21,6 +25,10 @@ pub struct BackendConfig {
     /// A pattern ending with `*` matches by prefix, `*` alone matches all.
     pub model_map: Vec<(String, String)>,
     pub max_concurrent: usize,
+    /// How long an idle Copilot SDK session is kept for a follow-up request.
+    pub session_ttl: Duration,
+    /// Maximum number of Copilot SDK sessions kept alive between requests.
+    pub max_sessions: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -42,7 +50,17 @@ pub struct Usage {
 pub enum TurnEvent {
     Text(String),
     Thought(String),
-    Done { stop_reason: String, usage: Usage },
+    /// A call of one of the client's tools. The client executes it and sends
+    /// the result back (with the same `id`) in its next request.
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: Value,
+    },
+    Done {
+        stop_reason: String,
+        usage: Usage,
+    },
     Error(String),
 }
 
@@ -247,6 +265,71 @@ impl Backend {
         let (tx, rx) = mpsc::channel(256);
         tokio::spawn(run_turn(proc, sid, prompt, updates, tx, permit));
         Ok(Turn { events: rx, model })
+    }
+
+    /// Run a chat request on the ACP agent. Client tools are emulated: they
+    /// are described in the prompt and `<tool_call>` blocks in the reply are
+    /// turned into [`TurnEvent::ToolCall`]s.
+    pub async fn start_chat(&self, req: &ChatRequest) -> Result<Turn> {
+        let prompt = crate::prompt::render(req);
+        let inner = self
+            .start_turn(
+                prompt,
+                TurnOptions {
+                    model: req.model.clone(),
+                    reasoning_effort: req.reasoning_effort.clone(),
+                },
+            )
+            .await?;
+        let tools_enabled = !req.tools.is_empty() && req.tool_choice != ToolChoice::None;
+        let freeform: HashSet<String> = req
+            .tools
+            .iter()
+            .filter(|t| t.freeform)
+            .map(|t| t.name.clone())
+            .collect();
+        let (tx, rx) = mpsc::channel(256);
+        let mut inner_events = inner.events;
+        tokio::spawn(async move {
+            let mut parser = ToolCallParser::new(tools_enabled);
+            let convert = |parsed: Vec<Parsed>| -> Vec<TurnEvent> {
+                parsed
+                    .into_iter()
+                    .map(|p| match p {
+                        Parsed::Text(t) => TurnEvent::Text(t),
+                        Parsed::ToolCall { name, arguments } => TurnEvent::ToolCall {
+                            id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+                            arguments: normalize_arguments(arguments, freeform.contains(&name)),
+                            name,
+                        },
+                    })
+                    .collect()
+            };
+            // Dropping `inner_events` (client gone) cancels the agent turn.
+            while let Some(ev) = tokio::select! {
+                ev = inner_events.recv() => ev,
+                _ = tx.closed() => None,
+            } {
+                let events = match ev {
+                    TurnEvent::Text(t) => convert(parser.push(&t)),
+                    ev @ (TurnEvent::Done { .. } | TurnEvent::Error(_)) => {
+                        let mut events = convert(parser.finish());
+                        events.push(ev);
+                        events
+                    }
+                    other => vec![other],
+                };
+                for ev in events {
+                    if tx.send(ev).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(Turn {
+            events: rx,
+            model: inner.model,
+        })
     }
 
     async fn select_model(
@@ -474,7 +557,7 @@ fn select_value(o: &Value) -> Option<ModelInfo> {
     })
 }
 
-fn explain_auth_error(e: anyhow::Error) -> anyhow::Error {
+pub(crate) fn explain_auth_error(e: anyhow::Error) -> anyhow::Error {
     let msg = format!("{e:#}");
     if msg.to_lowercase().contains("auth") {
         e.context("the Copilot CLI is not authenticated: run `copilot login` (or set COPILOT_GITHUB_TOKEN) and retry")

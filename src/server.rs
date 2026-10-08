@@ -13,12 +13,12 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
-use crate::backend::Backend;
+use crate::engine::Engine;
 use crate::{anthropic, openai, responses};
 
 #[derive(Clone)]
 pub struct AppState {
-    pub backend: Arc<Backend>,
+    pub backend: Arc<Engine>,
     pub api_key: Option<String>,
 }
 
