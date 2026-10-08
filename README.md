@@ -3,7 +3,7 @@
 Use your **GitHub Copilot subscription** from tools that speak the **Anthropic** or **OpenAI** API, such as **Claude Code** and **Codex CLI**.
 
 > [!IMPORTANT]
-> This is an unofficial, early project. It relies on an undocumented Copilot CLI protocol, requests may count against your Copilot premium requests, and some API parameters are ignored. Read the **[Limitations](#limitations)** before using it.
+> This is an unofficial, early project. It relies on an undocumented Copilot CLI protocol, requests may count against your Copilot premium requests, and some API parameters are ignored. Read the **[Limitations](#limitations)** (per backend: `sdk` or `acp`) before using it.
 
 `copilot-gateway` is a single small binary (Rust, no runtime needed) for **macOS, Linux and Windows**. It starts the GitHub Copilot CLI in headless mode and exposes it as an HTTP server:
 
@@ -248,15 +248,42 @@ copilot-gateway serve --copilot-bin "$(which copilot-gateway)" --no-default-copi
 
 ## Limitations
 
+### At a glance
+
+| | `sdk` (default) | `acp` (`--backend acp`) |
+| --- | --- | --- |
+| Client tools (Bash, Edit, exec_command...) | Native Copilot tools | Emulated through the prompt |
+| System prompt | The client's, replacing Copilot's | The client's, inside Copilot's agent prompt |
+| Copilot's own tools | Disabled | Disabled by `--available-tools=`, permission requests denied |
+| Conversation | One Copilot session per conversation | New session per request, whole conversation resent |
+| Tool loop (model → tool → result → model) | One Copilot prompt | One Copilot prompt per step |
+| Token usage | Reported by Copilot | Reported by Copilot when available, else estimated |
+| Protocol | Undocumented Copilot SDK protocol (experimental) | Agent Client Protocol (public spec) |
+
+### Both backends
+
 - **Unofficial.** This project is not affiliated with GitHub, Anthropic or OpenAI. Make sure your usage complies with the GitHub Copilot terms of service.
-- **Undocumented protocol.** The `sdk` backend speaks the Copilot SDK's JSON-RPC protocol (version 3), which is not publicly documented and is marked experimental. A Copilot CLI update could break it; `--backend acp` is the fallback.
-- **Premium requests.** Every new prompt sent to Copilot may count against your premium request quota, with the model's multiplier: each new conversation, each follow-up message, and each request the gateway cannot match to a live session. With the `sdk` backend, tool results continue the running turn instead of starting a new prompt. Claude Code also sends background requests (titles, summaries); use `--small-model` with a model included in your plan for those, and check your usage on GitHub.
-- **Conversation history.** Copilot only accepts history through its own sessions. When a request doesn't continue a session the gateway knows (gateway restart, session expired, history edited or compacted by the client, different model, system prompt or tools), a new session starts and the earlier messages are given to the model as a text transcript.
+- **Premium requests.** Every new prompt sent to Copilot may count against your premium request quota, with the model's multiplier (see each backend below for what counts as a new prompt). Claude Code also sends background requests (titles, summaries); use `--small-model` with a model included in your plan for those, and check your usage on GitHub.
 - **Ignored parameters:** `max_tokens`, `temperature`, `top_p`, stop sequences, `n`, `logprobs`, structured output (`response_format` / JSON schema), `parallel_tool_calls`. Copilot does not expose them; the model decides when to stop.
-- **Tool choice:** "must call tool X" is forwarded; "must call any tool" and "no tools" are not enforced.
-- **Thinking / reasoning** is forwarded only when the client asks for it (Anthropic `thinking`, OpenAI `reasoning`). Anthropic thinking blocks carry no signature, and reasoning sent back by clients is not replayed.
-- **Content types:** text and base64 images are supported. Remote image URLs are not fetched (only the URL is passed on). PDFs and other binary documents are not supported. Server-side/hosted tools (Anthropic `web_search`, OpenAI `web_search`, code interpreter...) are ignored.
-- **Token counts** are Copilot's when it reports them (`sdk`), otherwise estimated as characters ÷ 4 (`acp`). `count_tokens` is always an estimate.
+- **Thinking / reasoning** is forwarded only when the client asks for it (Anthropic `thinking`, OpenAI `reasoning`). Anthropic thinking blocks carry no signature, and reasoning sent back by clients is not replayed. The requested reasoning effort is applied only when the Copilot model supports that value.
+- **Content types:** text and base64 images are supported, including images in tool results. Remote image URLs are not fetched (only the URL is passed on). PDFs and other binary documents are not supported. Server-side/hosted tools (Anthropic `web_search`, OpenAI `web_search`, code interpreter...) are ignored.
+- **`count_tokens`** is always an estimate (characters ÷ 4): there is no tokenizer for Copilot's models.
 - **Model names** are matched approximately (see [Models](#models)). An unknown model silently falls back to the default; check the logs to know which model answered.
-- **`acp` backend only:** client tools are emulated through the prompt (a model may occasionally write a malformed call, returned as text), Copilot's own system prompt stays in place, and every request resends the whole conversation.
 - **Early version.** Protocol handling is covered by end-to-end tests with scripted mock agents and has been exercised with real Claude Code and Codex CLI clients, but not yet at scale with real Copilot models.
+
+### `sdk` backend (default)
+
+- **Undocumented protocol.** It speaks the JSON-RPC protocol of the GitHub Copilot SDK (version 3), which is not publicly documented and is marked experimental. A Copilot CLI update could break it; `--backend acp` is the fallback.
+- **New prompts** (premium requests): each new conversation, each follow-up user message, and each request the gateway cannot match to a live session. Tool results continue the running turn and do not start a new prompt.
+- **Conversation history.** Copilot only accepts history through its own sessions. When a request doesn't continue a session the gateway knows (gateway restart, session older than `--session-ttl`, more than `--max-sessions` conversations, history edited or compacted by the client, different model, system prompt or tools), a new session starts and the earlier messages are given to the model once, as a text transcript.
+- **Sessions live in memory**: restarting the gateway loses them (see above). A paused tool call whose result never comes back is discarded after `--session-ttl`.
+- **Tool choice:** "must call tool X" is forwarded; "must call any tool" and "no tools" are not enforced.
+
+### `acp` backend
+
+- **Tool calls are emulated.** ACP cannot declare client tools, so their definitions are written into the prompt and the model answers with `<tool_call>` text blocks that the gateway converts. A model may occasionally write a malformed call, which is returned as plain text; very large tool sets make the prompt longer and calls less reliable.
+- **Copilot's agent prompt stays in place.** The client's system prompt is given inside the conversation, so behavior can differ from the vendor's API more than with `sdk`.
+- **Stateless.** Every request opens a new Copilot session and resends the whole conversation as one prompt: slower on long conversations, no prompt caching, and **every request is a new prompt** (premium requests), including each step of a tool loop.
+- **Copilot's own tools** are disabled with `--available-tools=` and any permission request is denied (`--permission`); the effect of the flag depends on the Copilot CLI version.
+- **Tool choice:** "no tools" leaves the tool definitions out of the prompt; "must call a tool" and "must call tool X" are only requested in the prompt, not enforced.
+- **Token usage** comes from Copilot when it reports it, otherwise it is estimated (characters ÷ 4).
