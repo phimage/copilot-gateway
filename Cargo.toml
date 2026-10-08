@@ -1,6 +1,6 @@
 [package]
 name = "copilot-gateway"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Expose GitHub Copilot CLI (copilot --acp) as Anthropic and OpenAI compatible HTTP APIs, and run Claude Code or Codex CLI on a Copilot subscription"
