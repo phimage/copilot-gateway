@@ -2,6 +2,9 @@
 
 Use your **GitHub Copilot subscription** from tools that speak the **Anthropic** or **OpenAI** API, such as **Claude Code** and **Codex CLI**.
 
+> [!IMPORTANT]
+> This is an unofficial, early project. Tool calls are emulated (not native), every request may count against your Copilot premium requests, and several API parameters are ignored. Read the **[Limitations](#limitations)** before using it.
+
 `copilot-gateway` is a single small binary (Rust, no runtime needed) for **macOS, Linux and Windows**. It starts the GitHub Copilot CLI in [Agent Client Protocol](https://agentclientprotocol.com) mode (`copilot --acp`) and exposes it as an HTTP server:
 
 | API | Endpoint | Used by |
