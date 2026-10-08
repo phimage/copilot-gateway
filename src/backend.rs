@@ -495,10 +495,8 @@ pub fn normalize_model(name: &str) -> String {
         s.truncate(idx);
     }
     s = s.replace(['.', '_', ' '], "-");
-    for suffix in ["-latest"] {
-        if let Some(stripped) = s.strip_suffix(suffix) {
-            s = stripped.to_string();
-        }
+    if let Some(stripped) = s.strip_suffix("-latest") {
+        s = stripped.to_string();
     }
     // Trailing date: -20250929 or -2025-09-29.
     let parts: Vec<&str> = s.split('-').collect();
